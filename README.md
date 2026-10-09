@@ -42,26 +42,74 @@ A personal nutrition tracker built as a no-build-step PWA. Describe what you ate
 
 ---
 
-## Architecture
+## How it works
 
-```
-Browser (index.html)
-  ├─ React 18 + Babel Standalone (CDN — no build step)
-  ├─ Supabase JS SDK  ──►  Supabase Auth
-  │                   ──►  PostgreSQL (user_data table, RLS)
-  └─ fetch /api/claude ──►  Vercel Serverless Function
-                               ├─ JWT validation (Supabase)
-                               ├─ Email allowlist check (ALLOWED_EMAILS)
-                               └─ Anthropic Claude Sonnet 5.5
+The browser talks to Supabase directly for sign-in and sync, and to two small Vercel functions for anything that needs the Anthropic key. The key never reaches the browser.
+
+```mermaid
+flowchart LR
+  subgraph DEVICE["Your device"]
+    PWA["NutriTrack PWA<br/>index.html"]
+    LOCAL[("localStorage cache<br/>IndexedDB photo thumbnails")]
+  end
+
+  subgraph VERCEL["Vercel serverless"]
+    CL["api/claude.js<br/>validate, sanitize, size caps"]
+    RC["api/recap.js<br/>strict numeric validation"]
+    GATE["lib/auth.js<br/>JWT + ALLOWED_EMAILS<br/>fails closed"]
+    RAG["lib/rag.js<br/>nutrition hints, best effort"]
+  end
+
+  subgraph SUPA["Supabase"]
+    AUTH["Auth"]
+    DB[("user_data<br/>one JSONB row per user<br/>RLS")]
+  end
+
+  subgraph EXT["External APIs"]
+    LLM["Anthropic<br/>Claude Sonnet 5.5"]
+    TZ["Tzameret<br/>data.gov.il"]
+    FD["foodsdictionary.co.il"]
+  end
+
+  PWA --- LOCAL
+  PWA -- "sign in" --> AUTH
+  PWA <-->|"sync, 1.5 s debounce"| DB
+  PWA -- "meal or photo + JWT" --> CL
+  PWA -- "week of numbers + JWT" --> RC
+  CL --> GATE
+  RC --> GATE
+  GATE -- "whose token is this?" --> AUTH
+  CL --> RAG
+  RAG --> TZ
+  RAG --> FD
+  CL --> LLM
+  RC --> LLM
 ```
 
-**Data flow:**
-1. User types a meal description in the chat
-2. Browser sends the message + user JWT to `/api/claude`
-3. Vercel function validates the JWT with Supabase, checks the allowlist, then calls Claude
-4. Claude returns structured JSON `{items, total_calories, total_protein, message}`
-5. Frontend updates state → debounced write back to Supabase (1.5 s)
-6. On next load, state is restored from Supabase (falls back to localStorage)
+**The path of one meal**
+
+1. You type "2 eggs and a pita" (or snap a photo) in the chat.
+2. The browser sends the chat plus your Supabase JWT to `/api/claude`.
+3. `lib/auth.js` asks Supabase who the token belongs to, then checks the email against `ALLOWED_EMAILS`. With no allowlist configured, everyone is rejected.
+4. The payload is validated (message count, text length, one image max) and your profile numbers are clamped before they are put into the system prompt.
+5. `lib/rag.js` looks the food up in the Israeli Ministry of Health table (Tzameret) and foodsdictionary as hints. It is best effort and never blocks the request.
+6. Claude answers with structured JSON `{items, total_calories, total_protein, message}`. The server extracts the final JSON object and returns it.
+7. The app updates state, writes the `localStorage` cache and, after a 1.5 s debounce, upserts your row in Supabase. On the next load the Supabase copy wins and `localStorage` is the fallback.
+
+**Serverless functions**
+
+| Function | Job |
+|----------|-----|
+| `api/claude.js` | Auth, validation, RAG hints, then Claude parses a meal (text or photo) into calories, protein, carbs and fats |
+| `api/recap.js` | Auth, strict numeric validation, then a short weekly recap written from numbers only |
+
+**Notable design decisions**
+
+- **The server owns the prompt.** The browser sends meals and numbers, never prose that becomes instructions, so the system prompt cannot be rewritten from the client.
+- **Fails closed.** A missing or empty `ALLOWED_EMAILS` blocks everyone instead of opening the API to every signed-in user.
+- **Photos stay on the device.** The image is sent to Claude for the estimate. Only a small thumbnail is kept, in the browser's IndexedDB, and it is never written to Supabase.
+- **One row per user.** The whole app state is a single JSONB blob protected by Row Level Security, so there are no migrations to run beyond the SQL below.
+- **No Supabase Edge Functions.** All server logic is in the two Vercel functions above.
 
 ---
 
