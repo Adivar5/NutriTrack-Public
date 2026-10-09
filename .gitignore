@@ -1,0 +1,30 @@
+# Vercel
+.vercel
+
+# Environment variables
+.env
+.env.local
+.env*.local
+
+# Node
+node_modules/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+.backups/
+
+# Local Cursor / Claude tooling
+.claude/
+
+# Playwright test artifacts
+tests/node_modules/
+tests/test-results/
+tests/playwright-report/
+

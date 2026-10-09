@@ -1,0 +1,1397 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover"/>
+  <meta name="apple-mobile-web-app-capable" content="yes"/>
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"/>
+  <meta name="apple-mobile-web-app-title" content="NutriTrack"/>
+  <meta name="theme-color" content="#14110F"/>
+  <link rel="apple-touch-icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='22' fill='%2314110F'/><path d='M28 70C28 44 46 28 74 26C74 54 58 72 32 72Z' fill='%23E2774B'/><path d='M28 76L54 48' stroke='%2314110F' stroke-width='4' stroke-linecap='round'/></svg>"/>
+  <title>NutriTrack</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com"/>
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+  <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600&family=Manrope:wght@400;500;600;700&display=swap" rel="stylesheet"/>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #14110F; overscroll-behavior: none; font-family: 'Manrope', system-ui, -apple-system, sans-serif; -webkit-font-smoothing: antialiased; -webkit-tap-highlight-color: transparent; }
+    button, input, textarea { font-family: inherit; }
+    [style*="Fraunces"] { font-variant-numeric: lining-nums; }
+    button:focus-visible, input:focus-visible, textarea:focus-visible, a:focus-visible { outline: 2px solid #E2774B; outline-offset: 2px; }
+    @media (prefers-reduced-motion: reduce) { * { animation-duration: .01ms !important; transition-duration: .01ms !important; } }
+    input[type=number]::-webkit-inner-spin-button,
+    input[type=number]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
+    ::-webkit-scrollbar { width: 0; height: 0; }
+    textarea { resize: none; }
+  </style>
+  <!-- All CDN scripts are version-pinned with Subresource Integrity hashes. When bumping a
+       version, regenerate: curl -s URL | openssl dgst -sha384 -binary | openssl base64 -A -->
+  <script crossorigin="anonymous" src="https://unpkg.com/react@18.3.1/umd/react.production.min.js" integrity="sha384-DGyLxAyjq0f9SPpVevD6IgztCFlnMF6oW/XQGmfe+IsZ8TqEiDrcHkMLKI6fiB/Z"></script>
+  <script crossorigin="anonymous" src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js" integrity="sha384-gTGxhz21lVGYNMcdJOyq01Edg0jhn/c22nsx0kyqP0TxaV5WVdsSH1fSDUf5YJj1"></script>
+  <!-- Pin Babel 7: unpkg "latest" moved to v8, which emits ESM imports and breaks in-browser JSX -->
+  <script crossorigin="anonymous" src="https://unpkg.com/@babel/standalone@7.26.10/babel.min.js" integrity="sha384-BcI7nduYchENm39cFMEVJXHEE7fwHONANyn/pY2YTa+BNtrWF2bKBZeI0wqVithi"></script>
+  <script crossorigin="anonymous" src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.117.3/dist/umd/supabase.min.js" integrity="sha384-dl/4LkSyQ4uEucc48NM6VDZLAjLLq9yMzZ5JLXumBq7Ld33XBof73hseOqPhO89+"></script>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useRef } = React;
+
+// [insights:helpers]
+// Pure, client-side derived-display helpers (no I/O, no mutation).
+const PROTEIN_SUGGESTIONS = [
+  { grams: 15, text: "a Greek yogurt (~15g)" },
+  { grams: 25, text: "a tuna can (~25g)" },
+  { grams: 45, text: "150g chicken breast (~45g)" },
+];
+const PROTEIN_FALLBACK = "two 150g chicken breasts (~90g)";
+
+function proteinNudge(goals, totalProt, hour) {
+  const min = goals && Number(goals.protMin);
+  const have = Number(totalProt) || 0;
+  if (!min || !(min > 0) || have >= min) return null;
+  const remaining = Math.ceil(min - have);
+  const pick = PROTEIN_SUGGESTIONS.find((s) => s.grams >= remaining);
+  const prefix = hour >= 17 ? "Evening check: " : "";
+  return `${prefix}${remaining}g protein to go — ${pick ? pick.text : PROTEIN_FALLBACK}`;
+}
+
+function movingAverage(values, window) {
+  const list = Array.isArray(values) ? values : [];
+  const half = Math.floor((window > 0 ? window : 1) / 2);
+  return list.map((_, i) => {
+    const slice = list.slice(Math.max(0, i - half), i + half + 1);
+    return slice.reduce((s, v) => s + v, 0) / slice.length;
+  });
+}
+
+function parseDMY(str) {
+  const m = /^(\d{1,2})\/(\d{1,2})\/(\d{4})$/.exec(String(str || "").trim());
+  if (!m) return null;
+  const [d, mo, y] = [Number(m[1]), Number(m[2]), Number(m[3])];
+  const t = Date.UTC(y, mo - 1, d);
+  const back = new Date(t);
+  const ok = back.getUTCFullYear() === y && back.getUTCMonth() === mo - 1 && back.getUTCDate() === d;
+  return ok ? t : null;
+}
+
+function weeklyRate(entries) {
+  const DAY = 86400000;
+  const pts = (Array.isArray(entries) ? entries : [])
+    .map((e) => ({ t: parseDMY(e && e.date), w: Number(e && e.weight) }))
+    .filter((p) => p.t !== null && Number.isFinite(p.w) && p.w > 0)
+    .sort((a, b) => a.t - b.t);
+  if (pts.length === 0) return null;
+  const cutoff = pts[pts.length - 1].t - 28 * DAY;
+  const win = pts.filter((p) => p.t >= cutoff);
+  if (win.length < 3 || win[win.length - 1].t - win[0].t < 7 * DAY) return null;
+  const xs = win.map((p) => (p.t - win[0].t) / DAY);
+  const n = win.length;
+  const mx = xs.reduce((s, v) => s + v, 0) / n;
+  const my = win.reduce((s, p) => s + p.w, 0) / n;
+  const num = xs.reduce((s, x, i) => s + (x - mx) * (win[i].w - my), 0);
+  const den = xs.reduce((s, x) => s + (x - mx) * (x - mx), 0);
+  return den === 0 ? null : (num / den) * 7;
+}
+// [/insights:helpers]
+
+// ── Supabase ──────────────────────────────────────────────────────────────────
+const SUPABASE_URL = "https://YOUR-PROJECT-REF.supabase.co";
+const SUPABASE_ANON_KEY = "YOUR_SUPABASE_ANON_KEY";
+const sb = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+// ── Theme ─────────────────────────────────────────────────────────────────────
+// Warm-ink palette: terracotta accent, sage for "on target", amber for caution.
+const ACCENT="#E2774B",ACCENT2="#E5645A",GREEN="#8DBB8A",AMBER="#E3B25A";
+const BG="#14110F",CARD="#1E1A17",CARD2="#26211D",BORDER="rgba(243,235,221,0.10)";
+const TEXT="#F3EBDD",MUTED="#A39685",ON_ACCENT="#1A0F0A",NEUTRAL="#CDBFA9",TRACK="rgba(243,235,221,0.09)";
+const BODY="'Manrope',system-ui,-apple-system,sans-serif";
+const DISPLAY="'Fraunces',Georgia,serif";
+
+// ── Icons ─────────────────────────────────────────────────────────────────────
+// House style: 1.7 round-cap line, plus an offset tone (the same silhouette
+// shifted 1.6px down-right, like a misregistered print) when `active`.
+// Icons are used only for navigation, actions and status — never as decoration.
+const Icon=({name,size=18,color="currentColor",active=false,style:sx={}})=>{
+  const s={width:size,height:size,display:"inline-block",flexShrink:0,...sx};
+  const T={
+    chat:{
+      shape:<path d="M5.5 5h13A2.5 2.5 0 0 1 21 7.5v7a2.5 2.5 0 0 1-2.5 2.5H12l-4.5 3.5V17h-2A2.5 2.5 0 0 1 3 14.5v-7A2.5 2.5 0 0 1 5.5 5z"/>,
+      detail:<path d="M8 10h8M8 13h4.5"/>,
+    },
+    today:{
+      shape:<path d="M3.5 11.5h17c0 4.4-3.6 8-8.5 8s-8.5-3.6-8.5-8z"/>,
+      detail:<path d="M9 3.8c-.9 1.1.9 2 0 3.4M13.5 3.8c-.9 1.1.9 2 0 3.4"/>,
+    },
+    weight:{
+      shape:<path d="M6.5 4.5h11A2.5 2.5 0 0 1 20 7v10.5a2.5 2.5 0 0 1-2.5 2.5h-11A2.5 2.5 0 0 1 4 17.5V7a2.5 2.5 0 0 1 2.5-2.5z"/>,
+      detail:<path d="M8.4 10.4a4.2 3.4 0 0 1 7.2 0M12 10.4l1.4-1.9"/>,
+    },
+    insights:{
+      shape:<><rect x="4.5" y="12" width="3.6" height="7.5" rx="1.2"/><rect x="10.2" y="4.5" width="3.6" height="15" rx="1.2"/><rect x="15.9" y="8.5" width="3.6" height="11" rx="1.2"/></>,
+    },
+    settings:{
+      shape:<><circle cx="15" cy="7" r="2"/><circle cx="9" cy="17" r="2"/></>,
+      detail:<path d="M4 7h9M17 7h3M4 17h3M11 17h9"/>,
+    },
+    send:{line:<path d="M12 19V5M6 11l6-6 6 6"/>},
+    camera:{line:<><path d="M4.5 8h3l1.5-2.5h6L16.5 8h3a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1h-15a1 1 0 0 1-1-1V9a1 1 0 0 1 1-1z"/><circle cx="12" cy="13" r="3.3"/></>}, // [feat:photos]
+    logout:{line:<path d="M10 4.5H6.5a2 2 0 0 0-2 2v11a2 2 0 0 0 2 2H10M15 8l4 4-4 4M19 12H9.5"/>},
+    edit:{line:<><path d="M4 20l1-4L16.5 4.5a2 2 0 0 1 3 3L8 19l-4 1z"/><path d="M14.5 6.5l3 3"/></>},
+    trash:{line:<path d="M5 7h14M9.5 7V4.5h5V7M7 7l.8 12a1.5 1.5 0 0 0 1.5 1.4h5.4a1.5 1.5 0 0 0 1.5-1.4L17 7"/>},
+    check:{line:<path d="M5 12.5l4.5 4.5L19 7.5"/>},
+    alert:{line:<><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5v5.5M12 16.3v.1"/></>},
+    tip:{line:<><path d="M9 18h6M10 21h4"/><path d="M12 3.5a5.5 5.5 0 0 0-3.2 10c.5.4.7 1 .7 1.6V17h5v-1.9c0-.6.2-1.2.7-1.6A5.5 5.5 0 0 0 12 3.5z"/></>},
+    sync:{line:<><path d="M19.5 9A8 8 0 0 0 5 8M4.5 15A8 8 0 0 0 19 16"/><path d="M5 4v4h4M19 20v-4h-4"/></>},
+  };
+  const t=T[name]||{};
+  return(
+    <svg style={s} viewBox="0 0 24 24" fill="none" stroke={color} strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" focusable="false">
+      {active&&t.shape&&<g transform="translate(1.6 1.6)" fill={color} fillOpacity="0.28" stroke="none">{t.shape}</g>}
+      {t.shape}{t.detail}{t.line}
+    </svg>
+  );
+};
+
+// ── Small shared pieces (outside App so they never remount) ───────────────────
+const Label=({children,style})=>(
+  <div style={{fontSize:11,fontWeight:600,color:MUTED,textTransform:"uppercase",letterSpacing:"0.09em",...style}}>{children}</div>
+);
+const Bar=({pct,color,h=4})=>(
+  <div style={{height:h,borderRadius:h,background:TRACK}}>
+    <div style={{height:"100%",borderRadius:h,width:`${pct}%`,background:color,transition:"width .5s ease"}}/>
+  </div>
+);
+
+// ── Constants ─────────────────────────────────────────────────────────────────
+const SK="nutritrack_v5";
+function todayStr(){return new Date().toLocaleDateString("en-GB");}
+
+// New users get null personal metrics — they fill in Settings on first login
+const DEFAULT_SETTINGS={
+  tdee:null,calMin:null,calMax:null,
+  protMin:null,protMax:null,
+  startWeight:null,goalWeight:null,name:"",
+};
+
+function load(){
+  try{const r=localStorage.getItem(SK);if(r)return JSON.parse(r);}catch{}
+  return{settings:DEFAULT_SETTINGS,days:[],currentDay:{date:todayStr(),meals:[],activityCalories:0},weightLog:[]};
+}
+
+// [feat:export-helpers]
+const EXPORT_CSV_HEADER=["date","time","meal","calories","protein_g","carbs_g","fats_g","day_net_kcal","day_activity_kcal"];
+function exportDays(data){
+  const days=Array.isArray(data&&data.days)?data.days:[];
+  const cur=data&&data.currentDay;
+  return cur?[...days,{...cur,current:true}]:[...days];
+}
+function buildJsonExport(data,now=new Date()){
+  const d=data||{};
+  return JSON.stringify({
+    exportedAt:now.toISOString(),
+    app:"NutriTrack",
+    settings:d.settings||null,
+    days:exportDays(d),
+    weightLog:Array.isArray(d.weightLog)?d.weightLog:[],
+  },null,2);
+}
+function csvCell(v){
+  if(v===null||v===undefined||v==="")return"";
+  if(typeof v==="number")return Number.isFinite(v)?String(v):"";
+  let s=String(v);
+  if(/^[=+\-@\t\r]/.test(s))s="'"+s;
+  return /[",\r\n]/.test(s)?'"'+s.replace(/"/g,'""')+'"':s;
+}
+function buildCsv(data){
+  const rows=[EXPORT_CSV_HEADER.map(csvCell).join(",")];
+  exportDays(data).forEach(day=>{
+    const meals=Array.isArray(day.meals)?day.meals:[];
+    if(day.current&&!meals.length&&!day.activityCalories)return;
+    const tail=[day.netCal,day.activityCalories];
+    const lines=meals.length?meals:[{}];
+    lines.forEach(m=>rows.push([day.date,m.time,m.name,m.calories,m.protein,m.carbs,m.fats,...tail].map(csvCell).join(",")));
+  });
+  return"﻿"+rows.join("\r\n")+"\r\n";
+}
+function exportCounts(data){
+  const days=exportDays(data);
+  const meals=days.reduce((n,d)=>n+(Array.isArray(d.meals)?d.meals.length:0),0);
+  const wl=data&&Array.isArray(data.weightLog)?data.weightLog.length:0;
+  return{days:days.length,meals,weighIns:wl};
+}
+function exportFilename(ext,now=new Date()){
+  const p=n=>String(n).padStart(2,"0");
+  return`nutritrack-${now.getFullYear()}-${p(now.getMonth()+1)}-${p(now.getDate())}.${ext}`;
+}
+// [/feat:export-helpers]
+
+// [feat:export-deliver]
+function isIOSDevice(){
+  const ua=navigator.userAgent||"";
+  return /iPad|iPhone|iPod/.test(ua)||(navigator.platform==="MacIntel"&&navigator.maxTouchPoints>1);
+}
+async function deliverExport(filename,mime,text){
+  const blob=new Blob([text],{type:mime});
+  if(isIOSDevice()&&navigator.canShare&&navigator.share){
+    const file=new File([blob],filename,{type:mime});
+    if(navigator.canShare({files:[file]})){
+      try{await navigator.share({files:[file]});return true;}
+      catch(e){if(e&&e.name==="AbortError")return false;}
+    }
+  }
+  const url=URL.createObjectURL(blob);
+  try{
+    const a=document.createElement("a");
+    a.href=url;a.download=filename;a.style.display="none";
+    document.body.appendChild(a);a.click();a.remove();
+  }finally{setTimeout(()=>URL.revokeObjectURL(url),1000);}
+  return true;
+}
+async function runExport(kind,data,notify){
+  try{
+    const isCsv=kind==="csv";
+    const text=isCsv?buildCsv(data):buildJsonExport(data);
+    const done=await deliverExport(exportFilename(isCsv?"csv":"json"),isCsv?"text/csv;charset=utf-8":"application/json",text);
+    if(done)notify("Exported "+exportCounts(data).days+" days");
+  }catch(e){notify("Export failed: "+(e&&e.message?e.message:"unknown error"),"error");}
+}
+// [/feat:export-deliver]
+
+// [feat:saved]
+const SAVED_CAP=30;
+function newSavedId(){return Math.random().toString(36).slice(2,10);}
+// Pure: returns {list,added}. Never mutates; dedupes by case-insensitive name; caps at SAVED_CAP (oldest dropped).
+function addSavedMeal(list,meal){
+  const cur=Array.isArray(list)?list:[];
+  const name=String(meal?.name||"").trim();
+  if(!name)return{list:cur,added:false,reason:"empty"};
+  if(cur.some(m=>String(m.name).trim().toLowerCase()===name.toLowerCase()))return{list:cur,added:false,reason:"duplicate"};
+  const item={id:newSavedId(),name,calories:Number(meal.calories)||0,protein:Number(meal.protein)||0};
+  if(meal.carbs!==""&&meal.carbs!=null)item.carbs=Number(meal.carbs)||0;
+  if(meal.fats!==""&&meal.fats!=null)item.fats=Number(meal.fats)||0;
+  return{list:[...cur,item].slice(-SAVED_CAP),added:true};
+}
+// [/feat:saved]
+
+// ── Supabase sync helpers ─────────────────────────────────────────────────────
+function debounce(fn,ms){
+  let t;
+  return(...a)=>{clearTimeout(t);t=setTimeout(()=>fn(...a),ms);};
+}
+async function saveToSupabase(userId,blob){
+  const{error}=await sb.from('user_data').upsert({user_id:userId,data:blob},{onConflict:'user_id'});
+  if(error)console.warn('Supabase save:',error.message);
+}
+async function loadFromSupabase(userId){
+  const{data,error}=await sb.from('user_data').select('data').eq('user_id',userId).single();
+  if(error&&error.code!=='PGRST116')throw error;
+  return data?.data||null;
+}
+
+// ── Claude proxy (server-side key, no exposure) ───────────────────────────────
+// Sonnet 5.5 can lead with an empty thinking block. Read text blocks only,
+// and keep the last JSON object (a draft may precede the final meal).
+function assistantText(content){
+  if(!Array.isArray(content))return "";
+  return content.filter(b=>b&&typeof b.text==="string"&&b.type!=="thinking"&&b.type!=="redacted_thinking"&&(!b.type||b.type==="text")).map(b=>b.text).join("\n");
+}
+function jsonValueEnd(src,start){
+  let depth=0,inStr=false,esc=false;
+  for(let i=start;i<src.length;i++){
+    const c=src[i];
+    if(inStr){if(esc)esc=false;else if(c==="\\")esc=true;else if(c==='"')inStr=false;continue;}
+    if(c==='"'){inStr=true;continue;}
+    if(c==="{"||c==="[")depth++;
+    else if(c==="}"||c==="]"){depth--;if(depth===0)return i+1;}
+  }
+  return -1;
+}
+function lastJsonValue(text){
+  let last=null,i=0;
+  while(i<text.length){
+    const ch=text[i];
+    if(ch!=="{"&&ch!=="["){i++;continue;}
+    const end=jsonValueEnd(text,i);
+    if(end<0){i++;continue;}
+    try{last=JSON.parse(text.slice(i,end));i=end;}catch{i++;}
+  }
+  return last;
+}
+async function callClaude(messages,settings){
+  const{data:{session}}=await sb.auth.getSession();
+  if(!session)throw new Error("Not logged in");
+  const res=await fetch("/api/claude",{
+    method:"POST",
+    headers:{"Content-Type":"application/json","Authorization":`Bearer ${session.access_token}`},
+    body:JSON.stringify({messages,settings}),
+  });
+  const data=await res.json();
+  if(!res.ok)throw new Error(data.error||"API error");
+  if(data.error)throw new Error(data.error.message);
+  const text=assistantText(data.content);
+  // T3: server attaches data._rag when external nutrition sources matched.
+  const rag=data._rag||null;
+  function withRag(p){if(p&&rag)p._rag=rag;return p;}
+  const parsed=lastJsonValue(text);
+  if(parsed&&typeof parsed==="object"&&!Array.isArray(parsed))return withRag(parsed);
+  throw new Error("Could not parse response: "+text.substring(0,100));
+}
+
+// [feat:photos] ── Meal photo helpers (device-local thumbnails; never synced) ──────────
+const PHOTO_MAX_FILE=15*1024*1024;
+function loadImageFromFile(file){
+  return new Promise((resolve,reject)=>{
+    const url=URL.createObjectURL(file);
+    const img=new Image();
+    img.onload=()=>{URL.revokeObjectURL(url);resolve(img);};
+    img.onerror=()=>{URL.revokeObjectURL(url);reject(new Error("Could not read that photo. Try another image."));};
+    img.src=url;
+  });
+}
+function renderJpeg(img,maxSide,quality){
+  const scale=Math.min(1,maxSide/Math.max(img.width,img.height));
+  const c=document.createElement("canvas");
+  c.width=Math.max(1,Math.round(img.width*scale));c.height=Math.max(1,Math.round(img.height*scale));
+  c.getContext("2d").drawImage(img,0,0,c.width,c.height);
+  return c.toDataURL("image/jpeg",quality);
+}
+async function prepareMealPhoto(file){
+  if(!file||!String(file.type).startsWith("image/"))throw new Error("That file is not a photo.");
+  if(file.size>PHOTO_MAX_FILE)throw new Error("Photo is too large (max 15 MB).");
+  const img=await loadImageFromFile(file);
+  const full=renderJpeg(img,1024,0.7);
+  const thumb=renderJpeg(img,160,0.6);
+  return{data:full.split(",")[1],thumb};
+}
+const PHOTO_DB="nutritrack_photos",PHOTO_STORE="thumbs";
+function openPhotoDb(){
+  return new Promise((resolve,reject)=>{
+    if(!window.indexedDB){reject(new Error("IndexedDB unavailable"));return;}
+    const r=indexedDB.open(PHOTO_DB,1);
+    r.onupgradeneeded=()=>r.result.createObjectStore(PHOTO_STORE);
+    r.onsuccess=()=>resolve(r.result);
+    r.onerror=()=>reject(r.error);
+  });
+}
+async function putThumb(id,dataUrl){
+  try{
+    const db=await openPhotoDb();
+    await new Promise((res,rej)=>{const tx=db.transaction(PHOTO_STORE,"readwrite");tx.objectStore(PHOTO_STORE).put(dataUrl,id);tx.oncomplete=res;tx.onerror=()=>rej(tx.error);});
+    db.close();
+  }catch(e){console.warn("Photo thumbnail not saved on this device:",e.message);}
+}
+async function getThumb(id){
+  try{
+    const db=await openPhotoDb();
+    const v=await new Promise((res,rej)=>{const q=db.transaction(PHOTO_STORE).objectStore(PHOTO_STORE).get(id);q.onsuccess=()=>res(q.result);q.onerror=()=>rej(q.error);});
+    db.close();
+    return typeof v==="string"?v:null;
+  }catch(e){console.warn("Photo thumbnail unavailable:",e.message);return null;}
+}
+function newPhotoId(){return "p"+Date.now().toString(36)+Math.random().toString(36).slice(2,8);}
+function MealThumb({photoId,name}){
+  const[src,setSrc]=useState(null);
+  useEffect(()=>{let live=true;if(photoId)getThumb(photoId).then(v=>{if(live)setSrc(v);});return()=>{live=false;};},[photoId]);
+  if(!src)return null;
+  return <img src={src} alt={name} width={40} height={40} style={{width:40,height:40,borderRadius:8,objectFit:"cover",flexShrink:0,marginRight:12}}/>;
+}
+// [/feat:photos]
+
+// ── Login Screen ──────────────────────────────────────────────────────────────
+function LoginScreen(){
+  const[email,setEmail]=useState("");
+  const[password,setPassword]=useState("");
+  const[loading,setLoading]=useState(false);
+  const[error,setError]=useState("");
+  const fi={background:CARD2,border:`1px solid ${BORDER}`,borderRadius:12,padding:"12px 16px",fontSize:15,color:TEXT,outline:"none",width:"100%",fontFamily:BODY};
+  async function handleSubmit(e){
+    e.preventDefault();
+    if(!email||!password)return;
+    setLoading(true);setError("");
+    const{error:err}=await sb.auth.signInWithPassword({email,password});
+    if(err){setError(err.message);setLoading(false);}
+  }
+  return(
+    <div style={{background:BG,minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center",fontFamily:BODY,padding:24}}>
+      <div style={{width:"100%",maxWidth:360,background:CARD,border:`1px solid ${BORDER}`,borderRadius:20,padding:32}}>
+        <div style={{textAlign:"center",marginBottom:32}}>
+          <img src="Logo_NoBackground.png" alt="NutriTrack" style={{height:45,display:"block",margin:"0 auto 8px",filter:"brightness(0) invert(1) sepia(0.18)"}}/>
+          <div style={{fontSize:13,color:MUTED}}>Sign in to your account</div>
+        </div>
+        <form onSubmit={handleSubmit} style={{display:"flex",flexDirection:"column",gap:14}}>
+          <input type="email" value={email} onChange={e=>setEmail(e.target.value)} placeholder="Email" autoComplete="email" style={fi}/>
+          <input type="password" value={password} onChange={e=>setPassword(e.target.value)} placeholder="Password" autoComplete="current-password" style={fi}/>
+          {error&&<div style={{fontSize:12,color:ACCENT2,textAlign:"center"}}>{error}</div>}
+          <button type="submit" disabled={loading} style={{padding:"13px",borderRadius:14,border:"none",background:ACCENT,color:ON_ACCENT,fontWeight:700,fontSize:15,cursor:loading?"not-allowed":"pointer",opacity:loading?0.7:1}}>
+            {loading?"Signing in…":"Sign In"}
+          </button>
+        </form>
+      </div>
+    </div>
+  );
+}
+
+// ── Shared UI (outside App — prevents remount/focus-loss on every render) ────
+const SettingRow=({label,desc,children})=>(
+  <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"14px 0",borderBottom:`1px solid ${BORDER}`}}>
+    <div>
+      <div style={{fontSize:15,color:TEXT}}>{label}</div>
+      {desc&&<div style={{fontSize:11,color:MUTED,marginTop:2}}>{desc}</div>}
+    </div>
+    <div>{children}</div>
+  </div>
+);
+
+// [feat:recap]
+const RECAP_KEY="nutritrack_recap_v1";
+function recapPayload(d){
+  const num=v=>Number.isFinite(Number(v))?Number(v):0;
+  const days=(d.days||[]).slice(-7).map(x=>{
+    const prot=num(x.totalProt??x.totalProtein);
+    const net=num(x.netCal);
+    return{date:String(x.date||"").slice(0,20),totalCal:num(x.totalCal??net+num(x.activityCalories)),totalProt:prot,netCal:net};
+  });
+  const cd=d.currentDay||{};
+  const meals=cd.meals||[];
+  const cal=meals.reduce((a,m)=>a+num(m.calories),0);
+  const today=meals.length?{date:String(cd.date||"today").slice(0,20),totalCal:cal,totalProt:meals.reduce((a,m)=>a+num(m.protein),0),netCal:cal-num(cd.activityCalories)}:null;
+  const weights=(d.weightLog||[]).slice(-14).map(w=>({date:String(w.date||"").slice(0,20),weight:num(w.weight)}));
+  const st=d.settings||{};
+  const settings={tdee:num(st.tdee),calMin:num(st.calMin),calMax:num(st.calMax),protMin:num(st.protMin),protMax:num(st.protMax)};
+  return{settings,days,...(today?{today}:{}),weights};
+}
+function recapHash(days){
+  const str=JSON.stringify(days);let h=5381;
+  for(let i=0;i<str.length;i++)h=((h<<5)+h+str.charCodeAt(i))|0;
+  return String(h>>>0);
+}
+function loadRecap(){
+  try{
+    const r=JSON.parse(localStorage.getItem(RECAP_KEY)||"null");
+    if(r&&typeof r.text==="string"&&r.text&&typeof r.generatedAt==="string")return r;
+  }catch{}
+  return null;
+}
+async function fetchRecap(payload){
+  const{data:{session}}=await sb.auth.getSession();
+  if(!session)throw new Error("Not logged in");
+  const res=await fetch("/api/recap",{
+    method:"POST",
+    headers:{"Content-Type":"application/json","Authorization":`Bearer ${session.access_token}`},
+    body:JSON.stringify(payload),
+  });
+  let out={};
+  try{out=await res.json();}catch{}
+  if(!res.ok)throw new Error(out.error||"Recap failed ("+res.status+")");
+  const text=typeof out.recap==="string"?out.recap.replace(/[*_`#~]/g,"").trim():"";
+  if(!text)throw new Error("Empty recap");
+  return text;
+}
+function WeeklyRecap({data}){
+  const[recap,setRecap]=useState(loadRecap);
+  const[loading,setLoading]=useState(false);
+  const[err,setErr]=useState("");
+  const btn={minHeight:44,padding:"0 20px",borderRadius:12,fontWeight:700,fontSize:15,cursor:"pointer",border:"none"};
+  async function generate(){
+    setLoading(true);setErr("");
+    try{
+      const payload=recapPayload(data);
+      const text=await fetchRecap(payload);
+      const next={text,generatedAt:new Date().toISOString(),daysHash:recapHash(payload.days)};
+      setRecap(next);
+      try{localStorage.setItem(RECAP_KEY,JSON.stringify(next));}catch{}
+    }catch(e){setErr(e.message||"Something went wrong");}
+    setLoading(false);
+  }
+  if(data.days.length===0)return(
+    <div style={{fontSize:14,color:MUTED,padding:"14px 0",lineHeight:1.5}}>Press "New Day" at the end of a day to build history. Your weekly recap needs at least one saved day.</div>
+  );
+  return(
+    <div data-test="weekly-recap">
+      {recap&&!loading&&<>
+        {recap.text.split(/\n{2,}/).map((p,i)=><p key={i} style={{fontSize:14,color:TEXT,lineHeight:1.6,margin:"10px 0"}}>{p}</p>)}
+        <div style={{fontSize:12,color:MUTED,marginBottom:6}}>Generated {new Date(recap.generatedAt).toLocaleDateString("en-GB")}</div>
+      </>}
+      {loading&&<div role="status" style={{fontSize:14,color:MUTED,padding:"14px 0"}}>Writing your recap…</div>}
+      {err&&!loading&&<div role="alert" style={{fontSize:14,color:ACCENT2,padding:"10px 0",lineHeight:1.5}}>Couldn't write the recap: {err}</div>}
+      {!loading&&<button onClick={generate} style={recap&&!err?{...btn,background:"transparent",color:ACCENT,paddingInlineStart:0}:{...btn,background:ACCENT,color:ON_ACCENT}}>
+        {err?"Retry":recap?"Refresh":"Write my weekly recap"}
+      </button>}
+    </div>
+  );
+}
+// [/feat:recap]
+
+// ── App ───────────────────────────────────────────────────────────────────────
+function App(){
+  const[data,setData]=useState(load);
+  const[session,setSession]=useState(null);
+  const[authChecked,setAuthChecked]=useState(false);
+  const[syncing,setSyncing]=useState(false);
+  const[tab,setTab]=useState("chat");
+  const[input,setInput]=useState("");
+  const[photo,setPhoto]=useState(null),[photoErr,setPhotoErr]=useState(""),fileRef=useRef(null); // [feat:photos]
+  const[loading,setLoading]=useState(false);
+  const[chat,setChat]=useState([]);
+  const[newW,setNewW]=useState("");
+  const[toast,setToast]=useState(null);
+  const[draft,setDraft]=useState(null);
+  const[showBanner,setShowBanner]=useState(false);
+  const[editIdx,setEditIdx]=useState(null);
+  const[editDraft,setEditDraft]=useState(null);
+  const[favEdit,setFavEdit]=useState(false); // [feat:saved]
+  // Calendar drift prompt: shown when cd.date !== todayStr() AND meals exist.
+  // User picks Archive (move to days[]) or Keep (continue editing yesterday).
+  const[archivePrompt,setArchivePrompt]=useState(null);
+  const chatRef=useRef(null);
+  const inputRef=useRef(null);
+  const debouncedSaveRef=useRef(null);
+  // hydration guards: prevent debounced cloud-save from firing with stale
+  // localStorage state before the initial Supabase fetch resolves. Generation
+  // token discards late remote fetches that would clobber newer local edits.
+  // `hydrated` is state (not ref) so flipping it triggers the save effect even
+  // on paths that don't call setData (e.g., remote fetch error → fall through
+  // to localStorage-only mode).
+  const[hydrated,setHydrated]=useState(false);
+  const loadGenRef=useRef(0);
+  // dataRef always points to the most recent data object. loadUserData captures
+  // the reference at fetch-start; if it differs at fetch-end, a user mutation
+  // happened during the fetch and we MUST discard the remote (it would clobber
+  // the user's intent). Reference identity is exact: setData replaces the obj,
+  // re-renders without setData keep the same reference.
+  const dataRef=useRef(data);
+
+  // Auth bootstrap
+  useEffect(()=>{
+    sb.auth.getSession().then(({data:{session:s}})=>{
+      setSession(s);
+      if(s)loadUserData(s.user.id);
+      else setHydrated(true); // no session → localStorage is authoritative
+      setAuthChecked(true);
+    });
+    const{data:{subscription}}=sb.auth.onAuthStateChange((event,s)=>{
+      setSession(s);
+      if(s&&event==='SIGNED_IN')loadUserData(s.user.id);
+      if(event==='SIGNED_OUT'){setData(load());setHydrated(true);}
+    });
+    return()=>subscription.unsubscribe();
+  },[]);
+
+  // iOS install banner
+  useEffect(()=>{
+    const isIOS=/iphone|ipad|ipod/i.test(navigator.userAgent);
+    if(isIOS&&!window.navigator.standalone)setShowBanner(true);
+  },[]);
+
+  async function loadUserData(userId){
+    const gen=++loadGenRef.current;
+    const dataAtStart=dataRef.current;
+    try{
+      const remote=await loadFromSupabase(userId);
+      if(gen!==loadGenRef.current)return; // superseded by a newer load — discard
+      // If the user mutated local state while we were fetching, dataRef points
+      // to a different object than the snapshot we captured at start.
+      if(dataRef.current!==dataAtStart){console.warn('loadUserData: discarding remote — local edits made during fetch');return;}
+      if(remote){setData(remote);try{localStorage.setItem(SK,JSON.stringify(remote));}catch{}}
+    }catch(err){console.warn('Supabase load failed:',err.message);}
+    finally{if(gen===loadGenRef.current)setHydrated(true);}
+  }
+
+  // Save to localStorage always; cloud-save only AFTER hydration completes,
+  // so we never upsert stale localStorage over fresher remote data. Effect
+  // re-fires when `hydrated` flips, so error paths (remote fetch failed) and
+  // setData-less paths still get an initial save scheduled.
+  useEffect(()=>{
+    dataRef.current=data; // keep ref in sync for loadUserData's race detection
+    try{localStorage.setItem(SK,JSON.stringify(data));}catch{}
+    if(!hydrated)return;
+    if(session?.user?.id){
+      if(!debouncedSaveRef.current){
+        debouncedSaveRef.current=debounce(async(uid,blob)=>{
+          setSyncing(true);
+          await saveToSupabase(uid,blob);
+          setSyncing(false);
+        },1500);
+      }
+      debouncedSaveRef.current(session.user.id,data);
+    }
+  },[data,hydrated,session?.user?.id]);
+
+  useEffect(()=>{if(chatRef.current)chatRef.current.scrollTop=chatRef.current.scrollHeight;},[chat,loading]);
+  useEffect(()=>{if(tab==="settings")setDraft({...data.settings});},[tab]);
+
+  // Calendar reconciliation: check whenever data changes or the tab returns
+  // to visibility. If currentDay.date drifted from todayStr() and there are
+  // meals, prompt the user (never silently archive or discard).
+  useEffect(()=>{
+    function checkDrift(){
+      if(!hydrated)return;
+      const today=todayStr();
+      const cdDate=data?.currentDay?.date;
+      if(!cdDate||cdDate===today)return;
+      if((data.currentDay.meals||[]).length===0){
+        // Empty stale day — safe to silently roll the date forward.
+        setData(d=>({...d,currentDay:{...d.currentDay,date:today}}));
+        return;
+      }
+      // Non-empty stale day — ask the user before touching anything.
+      setArchivePrompt(p=>p||{from:cdDate,to:today,mealCount:data.currentDay.meals.length});
+    }
+    checkDrift();
+    function onVis(){if(document.visibilityState==='visible'){checkDrift();if(session?.user?.id)loadUserData(session.user.id);}}
+    function onShow(){checkDrift();if(session?.user?.id)loadUserData(session.user.id);}
+    document.addEventListener('visibilitychange',onVis);
+    window.addEventListener('pageshow',onShow);
+    return()=>{document.removeEventListener('visibilitychange',onVis);window.removeEventListener('pageshow',onShow);};
+  },[data.currentDay?.date,data.currentDay?.meals?.length,session?.user?.id,hydrated]);
+
+  function confirmArchive(){
+    if(!archivePrompt)return;
+    setData(d=>{
+      const cd=d.currentDay;
+      const totalCal=(cd.meals||[]).reduce((s,m)=>s+(m.calories||0),0);
+      const totalProt=(cd.meals||[]).reduce((s,m)=>s+(m.protein||0),0);
+      const actCal=cd.activityCalories||0;
+      const netCal=totalCal-actCal;
+      return{...d,
+        days:[...(d.days||[]),{date:cd.date,meals:cd.meals,activityCalories:actCal,totalCal,totalProt,netCal}],
+        currentDay:{date:todayStr(),meals:[],activityCalories:0}};
+    });
+    setArchivePrompt(null);
+    showToast(`Archived ${archivePrompt.mealCount} meals from ${archivePrompt.from}`);
+  }
+  function dismissArchive(){
+    // User chose "Keep editing": leave currentDay untouched so they can finish
+    // logging meals attributed to the original date. Prompt re-appears next
+    // visibility change — intentional, since drift is still unresolved.
+    setArchivePrompt(null);
+  }
+
+  // Redirect new users to settings
+  const needsSetup=!data.settings.tdee||!data.settings.calMin;
+  useEffect(()=>{if(needsSetup&&session)setTab("settings");},[session]);
+
+  const cfg=data.settings;
+  const cd=data.currentDay;
+  const totalCal=cd.meals.reduce((s,m)=>s+(m.calories||0),0);
+  const totalProt=cd.meals.reduce((s,m)=>s+(m.protein||0),0);
+  // T2: carbs/fats are display-only stats. Meals from before this feature
+  // shipped will have undefined values → contribute 0 to totals; per-meal
+  // display falls back to "—".
+  const totalCarbs=cd.meals.reduce((s,m)=>s+(m.carbs||0),0);
+  const totalFats=cd.meals.reduce((s,m)=>s+(m.fats||0),0);
+  const anyMacrosKnown=cd.meals.some(m=>m.carbs!=null||m.fats!=null);
+  const actCal=cd.activityCalories||0;
+  const netCal=totalCal-actCal;
+  const deficit=(cfg.tdee||0)-netCal;
+  const calPct=cfg.calMax?Math.min(100,Math.round((netCal/cfg.calMax)*100)):0;
+  const protPct=cfg.protMax?Math.min(100,Math.round((totalProt/cfg.protMax)*100)):0;
+  const calColor=netCal>(cfg.calMax||0)?ACCENT2:netCal>=(cfg.calMin||0)?GREEN:NEUTRAL;
+  const protColor=totalProt>=(cfg.protMin||0)?GREEN:NEUTRAL;
+
+  function showToast(msg,kind){setToast({text:msg,error:kind==="error"});setTimeout(()=>setToast(null),3000);}
+
+  // [feat:photos]
+  async function onPickPhoto(e){
+    const file=e.target.files&&e.target.files[0];
+    e.target.value="";
+    if(!file)return;
+    setPhotoErr("");
+    try{setPhoto(await prepareMealPhoto(file));}
+    catch(err){setPhoto(null);setPhotoErr(err.message);}
+  }
+  // [/feat:photos]
+  async function send(){
+    if((!input.trim()&&!photo)||loading)return;
+    if(needsSetup){showToast("Complete your profile in Settings first");setTab("settings");return;}
+    const msg=input.trim();setInput("");
+    const sentPhoto=photo;setPhoto(null);setPhotoErr(""); // [feat:photos]
+    const now=new Date().toLocaleTimeString("en-GB",{hour:"2-digit",minute:"2-digit"});
+    const optimisticMeal={name:"Calculating...",calories:0,protein:0,time:now,optimistic:true};
+    setData(d=>({...d,currentDay:{...cd,meals:[...cd.meals,optimisticMeal]}}));
+    // [feat:photos] history stays text-only so base64 is never re-sent on later turns
+    const histText=sentPhoto?(msg?msg+" [photo]":"[photo]"):msg;
+    const hist=[...chat,{role:"user",content:histText}];
+    const apiMsgs=hist.map(h=>({role:h.role,content:h.content}));
+    if(sentPhoto)apiMsgs[apiMsgs.length-1]={role:"user",content:[{type:"image",source:{type:"base64",media_type:"image/jpeg",data:sentPhoto.data}},{type:"text",text:msg||"Photo of my meal. Please log it."}]};
+    // [/feat:photos]
+    setChat([...hist,{role:"assistant",content:"⏳ Analysing..."}]);
+    setLoading(true);
+    try{
+      const p=await callClaude(apiMsgs,cfg);
+      // T2: pass through carbs/fats when Claude provides them (legacy responses
+      // omit these fields → meal stays without them, UI shows "—").
+      const photoId=sentPhoto&&(p.items||[]).length?newPhotoId():null; // [feat:photos]
+      if(photoId)putThumb(photoId,sentPhoto.thumb); // [feat:photos] device-local only
+      const realItems=(p.items||[]).map(it=>{
+        const m={name:it.name,calories:it.calories||0,protein:it.protein||0,time:now};
+        if(photoId)m.photoId=photoId; // [feat:photos]
+        if(it.carbs!=null)m.carbs=Number(it.carbs)||0;
+        if(it.fats!=null)m.fats=Number(it.fats)||0;
+        return m;
+      });
+      const meals=[...cd.meals,...realItems];
+      const act=actCal+(p.activity_calories||0);
+      setData(d=>({...d,currentDay:{...cd,meals,activityCalories:act}}));
+      showToast(`+${p.total_calories} kcal · ${Math.round(p.total_protein)}g protein`);
+      const nn=meals.reduce((s,m)=>s+m.calories,0)-act;
+      const np=meals.reduce((s,m)=>s+m.protein,0);
+      const reply=`${p.message||"Logged!"}\n\nToday so far: **${nn} kcal** · protein **${Math.round(np)}g** · deficit **+${(cfg.tdee||0)-nn}**`;
+      // T3: when RAG sources matched, annotate the assistant message so the
+      // chat bubble can render a small "IL data" badge. Both sources optional.
+      const assistantMsg={role:"assistant",content:reply};
+      if(p._rag){assistantMsg.rag=p._rag;}
+      setChat([...hist,assistantMsg]);
+    }catch(e){
+      setData(d=>({...d,currentDay:{...cd,meals:cd.meals}}));
+      setChat([...hist,{role:"assistant",content:`Error: ${e.message}. Please try again.`}]);
+    }
+    setLoading(false);inputRef.current?.focus();
+  }
+
+  function newDay(){
+    setData(d=>({...d,days:[...d.days,{date:cd.date,meals:cd.meals,activityCalories:actCal,totalCal,totalProt,netCal}],currentDay:{date:todayStr(),meals:[],activityCalories:0}}));
+    setChat([{role:"assistant",content:`New day! Yesterday's deficit: **${(cfg.tdee||0)-netCal} kcal**. Let's go!`}]);
+  }
+
+  function resetDay(){
+    if(!window.confirm("Reset today? All meals and activity for today will be cleared."))return;
+    setData(d=>({...d,currentDay:{date:todayStr(),meals:[],activityCalories:0}}));
+    setChat([{role:"assistant",content:"Today's log has been reset. Fresh start!"}]);
+    showToast("Today's log cleared");
+  }
+
+  function saveMealEdit(){
+    if(editIdx===null||!editDraft)return;
+    // T2: empty carbs/fats inputs (string "") mean "leave the field absent",
+    // not "set to 0". Strip them from the patch so legacy meals don't acquire
+    // a misleading 0 value.
+    const patch={name:editDraft.name,calories:editDraft.calories,protein:editDraft.protein};
+    if(editDraft.carbs!==""&&editDraft.carbs!=null)patch.carbs=Number(editDraft.carbs)||0;
+    if(editDraft.fats!==""&&editDraft.fats!=null)patch.fats=Number(editDraft.fats)||0;
+    const updatedMeals=cd.meals.map((m,i)=>{
+      if(i!==editIdx)return m;
+      const next={...m,...patch};
+      // If user cleared the carbs/fats input, remove the field entirely.
+      if(editDraft.carbs===""||editDraft.carbs==null)delete next.carbs;
+      if(editDraft.fats===""||editDraft.fats==null)delete next.fats;
+      return next;
+    });
+    setData(d=>({...d,currentDay:{...d.currentDay,meals:updatedMeals}}));
+    setEditIdx(null);setEditDraft(null);showToast("Updated!");
+  }
+
+  function removeMeal(idx){
+    const updatedMeals=cd.meals.filter((_,i)=>i!==idx);
+    setData(d=>({...d,currentDay:{...d.currentDay,meals:updatedMeals}}));
+    setEditIdx(null);setEditDraft(null);showToast("Meal removed");
+  }
+
+  // [feat:saved]
+  function addFavourite(){
+    if(!editDraft)return;
+    const res=addSavedMeal(data.savedMeals,editDraft);
+    if(!res.added){showToast(res.reason==="duplicate"?"Already in favourites":"Name is required");return;}
+    setData(d=>({...d,savedMeals:res.list}));
+    showToast("Added to favourites");
+  }
+  function removeFavourite(id){
+    setData(d=>({...d,savedMeals:(d.savedMeals||[]).filter(m=>m.id!==id)}));
+  }
+  function logFavourite(fav){
+    if(loading)return; // a pending send() would overwrite this meal when it resolves
+    const now=new Date().toLocaleTimeString("en-GB",{hour:"2-digit",minute:"2-digit"});
+    const meal={name:fav.name,calories:fav.calories,protein:fav.protein,time:now};
+    if(fav.carbs!=null)meal.carbs=fav.carbs;
+    if(fav.fats!=null)meal.fats=fav.fats;
+    const meals=[...cd.meals,meal];
+    setData(d=>({...d,currentDay:{...d.currentDay,meals}}));
+    const nn=meals.reduce((s,m)=>s+m.calories,0)-actCal;
+    const np=meals.reduce((s,m)=>s+m.protein,0);
+    showToast(`Logged ${fav.name}`);
+    setChat(c=>[...c,{role:"assistant",content:`Logged **${fav.name}** (${fav.calories} kcal · ${Math.round(fav.protein)}g protein)
+
+Today so far: **${nn} kcal** · protein **${Math.round(np)}g** · deficit **+${(cfg.tdee||0)-nn}**`}]);
+  }
+  function renderFavChips(){
+    const favs=(data.savedMeals||[]).slice(-8).reverse();
+    if(!favs.length)return null;
+    return(
+      <div data-test="fav-chips" style={{marginTop:8}}>
+        <div style={{display:"flex",gap:8,overflowX:"auto",scrollbarWidth:"none",paddingBottom:2}}>
+          {favs.map(f=>(
+            <div key={f.id} style={{display:"flex",flexShrink:0,alignItems:"center",border:`1px solid ${BORDER}`,borderRadius:22,minHeight:44}}>
+              <button onClick={()=>logFavourite(f)} disabled={favEdit||loading} style={{minHeight:44,padding:"0 14px",background:"transparent",border:"none",color:TEXT,fontSize:13,cursor:favEdit?"default":"pointer",whiteSpace:"nowrap"}}>
+                {f.name} <span style={{color:MUTED}}>· {f.calories} kcal</span>
+              </button>
+              {favEdit&&<button aria-label={`Remove ${f.name}`} onClick={()=>removeFavourite(f.id)} style={{width:44,minHeight:44,background:"transparent",border:"none",color:ACCENT2,fontSize:18,cursor:"pointer"}}>×</button>}
+            </div>
+          ))}
+        </div>
+        <button onClick={()=>setFavEdit(v=>!v)} style={{minHeight:44,background:"transparent",border:"none",color:ACCENT,fontSize:12,cursor:"pointer",padding:"0 4px"}}>{favEdit?"Done":"Edit favourites"}</button>
+      </div>
+    );
+  }
+  // [/feat:saved]
+
+  function addWeight(){
+    const w=parseFloat(newW);if(!w||w<40||w>300)return;
+    setData(d=>({...d,weightLog:[...d.weightLog,{date:todayStr(),weight:w}]}));
+    setNewW("");showToast(`Weight ${w} kg saved`);
+  }
+
+  function saveSettings(){
+    if(!draft)return;
+    setData(d=>({...d,settings:{...draft}}));
+    showToast("Settings saved!");
+    setTab("chat");
+  }
+
+  const wl=data.weightLog;
+  const latestW=wl.length?wl[wl.length-1].weight:(cfg.startWeight||"—");
+  const firstW=wl.length?wl[0].weight:(cfg.startWeight||0);
+  const totalLost=wl.length>1?(firstW-latestW).toFixed(1):"0.0";
+  const weekDays=data.days.slice(-7);
+  const avgCal=weekDays.length?Math.round(weekDays.reduce((s,d)=>s+d.netCal,0)/weekDays.length):null;
+  const avgProt=weekDays.length?Math.round(weekDays.reduce((s,d)=>s+d.totalProt,0)/weekDays.length):null;
+  const weekDef=weekDays.reduce((s,d)=>s+((cfg.tdee||0)-d.netCal),0);
+
+  const tabs=[
+    {id:"chat",icon:"chat",label:"Chat"},
+    {id:"today",icon:"today",label:"Today"},
+    {id:"weight",icon:"weight",label:"Weight"},
+    {id:"insights",icon:"insights",label:"Insights"},
+    {id:"settings",icon:"settings",label:"Settings"},
+  ];
+
+  const fld={background:CARD,border:`1px solid ${BORDER}`,borderRadius:12,padding:"11px 12px",fontSize:16,color:TEXT,outline:"none",width:"100%",minHeight:46};
+
+  // ── Session guard ─────────────────────────────────────────────────────────
+  if(!authChecked)return(
+    <div style={{background:BG,minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center"}}>
+      <div style={{textAlign:"center"}}>
+        <img src="Logo_NoBackground.png" alt="NutriTrack" style={{height:42,display:"block",margin:"0 auto 16px",filter:"brightness(0) invert(1) sepia(0.18)"}}/>
+        <div style={{width:32,height:32,border:`3px solid ${BORDER}`,borderTopColor:ACCENT,borderRadius:"50%",animation:"spin 0.8s linear infinite",margin:"0 auto"}}/>
+        <style>{`@keyframes spin{to{transform:rotate(360deg)}}`}</style>
+      </div>
+    </div>
+  );
+  if(!session)return <LoginScreen/>;
+
+  return(
+    <div style={{background:BG,minHeight:"100vh",fontFamily:BODY,color:TEXT,maxWidth:430,margin:"0 auto",paddingBottom:"calc(96px + env(safe-area-inset-bottom))",paddingTop:"env(safe-area-inset-top)"}}>
+
+      {showBanner&&(
+        <div style={{background:CARD2,padding:"10px 16px",display:"flex",alignItems:"center",justifyContent:"space-between",fontSize:12,color:MUTED,borderBottom:`1px solid ${BORDER}`}}>
+          <span>Tap <strong style={{color:ACCENT}}>Share → Add to Home Screen</strong> to install</span>
+          <button onClick={()=>setShowBanner(false)} style={{background:"transparent",border:"none",color:MUTED,fontSize:18,cursor:"pointer",padding:"0 4px"}}>×</button>
+        </div>
+      )}
+
+      {needsSetup&&tab!=="settings"&&(
+        <div style={{background:`${AMBER}18`,border:`1px solid ${AMBER}44`,margin:"12px 16px",borderRadius:12,padding:"10px 14px",display:"flex",alignItems:"center",gap:8,fontSize:13,color:AMBER}}>
+          <Icon name="alert" size={14} color={AMBER}/>
+          <span>Set up your profile to start tracking</span>
+          <button onClick={()=>setTab("settings")} style={{marginLeft:"auto",background:AMBER,border:"none",borderRadius:8,padding:"4px 10px",fontSize:12,color:"#000",fontWeight:600,cursor:"pointer"}}>Setup</button>
+        </div>
+      )}
+
+      {/* HERO */}
+      <div style={{padding:"18px 20px 18px",borderBottom:`1px solid ${BORDER}`}}>
+        <div style={{position:"relative",display:"flex",flexDirection:"column",alignItems:"center",marginBottom:(tab==="chat"||tab==="today")?20:0}}>
+          <div style={{width:168,height:69,overflow:"hidden"}}>
+            <img src="Logo_NoBackground.png" alt="NutriTrack" style={{width:"100%",height:"100%",objectFit:"cover",objectPosition:"50% 84%",display:"block",filter:"brightness(0) invert(1) sepia(0.18)"}}/>
+          </div>
+          <div style={{fontSize:12,color:MUTED,marginTop:4,display:"flex",alignItems:"center",gap:6}}>
+            {cd.date}
+            {syncing&&<Icon name="sync" size={12} color={MUTED} style={{animation:"spin 1s linear infinite"}}/>}
+          </div>
+          <button onClick={()=>sb.auth.signOut()} title="Sign out" aria-label="Sign out" style={{position:"absolute",top:0,right:0,width:44,height:44,background:"transparent",border:`1px solid ${BORDER}`,borderRadius:12,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center"}}>
+            <Icon name="logout" size={19} color={MUTED}/>
+          </button>
+        </div>
+        {(tab==="chat"||tab==="today")&&<>
+        <div style={{display:"grid",gridTemplateColumns:"1.25fr 1fr 1fr",marginBottom:18}}>
+          {[
+            {val:netCal,label:"kcal net",color:calColor,big:true},
+            {val:`${Math.round(totalProt)}g`,label:"protein",color:protColor},
+            {val:deficit>0?`+${deficit}`:deficit,label:"deficit",color:TEXT},
+          ].map(({val,label,color,big},i)=>(
+            <div key={label} style={{paddingLeft:i?14:0,borderLeft:i?`1px solid ${BORDER}`:"none"}}>
+              <div style={{fontFamily:DISPLAY,fontSize:big?38:26,fontWeight:600,color,lineHeight:1,letterSpacing:"-0.01em",paddingTop:big?0:9}}>{val}</div>
+              <div style={{fontSize:11,color:MUTED,marginTop:6}}>{label}</div>
+            </div>
+          ))}
+        </div>
+        <div style={{display:"flex",flexDirection:"column",gap:10}}>
+          {[
+            {label:"Calories",val:`${netCal} / ${cfg.calMax||"—"}`,pct:calPct,color:calColor},
+            {label:"Protein",val:`${Math.round(totalProt)}g / ${cfg.protMax||"—"}g`,pct:protPct,color:protColor},
+          ].map(b=>(
+            <div key={b.label}>
+              <div style={{display:"flex",justifyContent:"space-between",fontSize:12,color:MUTED,marginBottom:5}}>
+                <span>{b.label}</span><span style={{color:TEXT}}>{b.val}</span>
+              </div>
+              <Bar pct={b.pct} color={b.color}/>
+            </div>
+          ))}
+        </div>
+        </>}
+      </div>
+
+      {toast&&(
+        <div role={toast.error?"alert":undefined} style={{position:"fixed",top:16,left:"50%",transform:"translateX(-50%)",background:CARD2,border:`1px solid ${toast.error?ACCENT2:GREEN}44`,borderRadius:12,padding:"9px 18px",zIndex:100,fontSize:13,color:toast.error?ACCENT2:GREEN,whiteSpace:"nowrap",display:"flex",alignItems:"center",gap:7,animation:"fadeIn .25s ease"}}>
+          <Icon name={toast.error?"alert":"check"} size={13} color={toast.error?ACCENT2:GREEN}/>{toast.text}
+        </div>
+      )}
+
+      {archivePrompt&&(
+        <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.65)",zIndex:200,display:"flex",alignItems:"center",justifyContent:"center",padding:20}}>
+          <div style={{background:CARD,border:`1px solid ${BORDER}`,borderRadius:18,padding:22,maxWidth:340,width:"100%"}}>
+            <div style={{fontSize:20,fontWeight:600,color:TEXT,marginBottom:8,fontFamily:DISPLAY}}>New day detected</div>
+            <div style={{fontSize:13,color:MUTED,lineHeight:1.5,marginBottom:18}}>
+              You have <b style={{color:TEXT}}>{archivePrompt.mealCount} meals</b> logged on <b style={{color:TEXT}}>{archivePrompt.from}</b>, but today is <b style={{color:TEXT}}>{archivePrompt.to}</b>.
+              <br/><br/>
+              Archive them to your history and start a fresh day, or keep editing {archivePrompt.from}?
+            </div>
+            <div style={{display:"flex",gap:8}}>
+              <button onClick={dismissArchive} style={{flex:1,padding:14,borderRadius:12,background:"transparent",border:`1px solid ${BORDER}`,color:TEXT,fontSize:13,cursor:"pointer"}}>
+                Keep editing
+              </button>
+              <button onClick={confirmArchive} style={{flex:1,padding:14,borderRadius:12,background:ACCENT,border:"none",color:ON_ACCENT,fontSize:13,fontWeight:700,cursor:"pointer"}}>
+                Archive & start today
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <div style={{padding:"22px 20px"}}>
+
+        {/* CHAT */}
+        {tab==="chat"&&<>
+          <div ref={chatRef} style={{height:`calc(100dvh - ${(data.savedMeals||[]).length?620:520}px)`,minHeight:220,overflowY:"auto",display:"flex",flexDirection:"column",gap:10,paddingBottom:8,scrollbarWidth:"none"}}>
+            {chat.length===0&&(
+              <div style={{textAlign:"center",marginTop:28,color:MUTED}}>
+                <div style={{fontSize:22,fontWeight:500,color:TEXT,marginBottom:6,fontFamily:DISPLAY}}>What did you eat today?</div>
+                <div style={{fontSize:12,marginBottom:20}}>Type freely — Hebrew or English</div>
+                {((data.savedMeals||[]).length?[]:["Chicken breast 150g + rice","ארוחת בוקר - ביצים + פיתה","Ran 5km"]).map(s=>(
+                  <button key={s} onClick={()=>setInput(s)} style={{display:"block",margin:"6px auto",background:"transparent",border:`1px solid ${BORDER}`,borderRadius:20,padding:"11px 18px",fontSize:14,color:TEXT,cursor:"pointer"}}>{s}</button>
+                ))}
+              </div>
+            )}
+            {chat.map((m,i)=>{
+              const isUser=m.role==="user";
+              const parts=m.content.split(/\*\*(.*?)\*\*/g);
+              return(
+                <div key={i} style={{display:"flex",justifyContent:isUser?"flex-start":"flex-end"}}>
+                  <div style={{maxWidth:"78%",padding:"10px 14px",borderRadius:isUser?"18px 18px 18px 4px":"18px 18px 4px 18px",background:isUser?"#3A281E":CARD2,border:isUser?`1px solid ${ACCENT}55`:`1px solid ${BORDER}`,fontSize:14,lineHeight:1.55,color:TEXT,whiteSpace:"pre-wrap"}}>
+                    {parts.map((p,j)=>j%2===1?<strong key={j} style={{color:GREEN}}>{p}</strong>:p)}
+                    {/* T3: small badge when external IL nutrition sources contributed. */}
+                    {!isUser&&m.rag&&(m.rag.tzameret_hits>0||m.rag.foodsdictionary_url)&&(
+                      <div data-test="rag-badge" style={{marginTop:6,display:"flex",alignItems:"center",gap:6,fontSize:11,color:MUTED,borderTop:`1px solid ${BORDER}`,paddingTop:6}}>
+                        <span style={{fontSize:10}}>{String.fromCodePoint(0x1F1EE,0x1F1F1)}</span>
+                        <span>
+                          {m.rag.tzameret_hits>0&&`Tzameret · ${m.rag.tzameret_hits} match${m.rag.tzameret_hits===1?"":"es"}`}
+                          {m.rag.tzameret_hits>0&&m.rag.foodsdictionary_url&&" · "}
+                          {m.rag.foodsdictionary_url&&(
+                            <a href={m.rag.foodsdictionary_url} target="_blank" rel="noopener noreferrer" style={{color:ACCENT,textDecoration:"none"}}>foodsdictionary</a>
+                          )}
+                        </span>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+            {loading&&(
+              <div style={{display:"flex",justifyContent:"flex-end",alignItems:"flex-end",gap:8}}>
+                <div style={{background:CARD2,border:`1px solid ${BORDER}`,borderRadius:"18px 18px 4px 18px",padding:"12px 16px",display:"flex",gap:4}}>
+                  {[0,1,2].map(i=><span key={i} style={{width:6,height:6,borderRadius:"50%",background:ACCENT,display:"inline-block",animation:`bounce .8s ${i*0.2}s infinite`}}/>)}
+                </div>
+              </div>
+            )}
+          </div>
+          {/* [feat:saved] */}{renderFavChips()}{/* [/feat:saved] */}
+          {/* [feat:photos] */}
+          {photo&&(
+            <div data-testid="photo-chip" style={{display:"flex",alignItems:"center",gap:10,marginTop:8,padding:"4px 4px 4px 4px",border:`1px solid ${BORDER}`,borderRadius:12,width:"fit-content"}}>
+              <img src={photo.thumb} alt="Meal photo preview" width={40} height={40} style={{width:40,height:40,borderRadius:8,objectFit:"cover"}}/>
+              <span style={{fontSize:13,color:MUTED}}>Photo attached</span>
+              <button onClick={()=>setPhoto(null)} aria-label="Remove photo" style={{width:44,height:44,background:"transparent",border:"none",cursor:"pointer",color:ACCENT,fontSize:20,lineHeight:1}}>×</button>
+            </div>
+          )}
+          {photoErr&&<div role="alert" style={{marginTop:8,fontSize:13,color:ACCENT2}}>{photoErr}</div>}
+          {/* [/feat:photos] */}
+          <div style={{display:"flex",gap:8,marginTop:8}}>
+            <textarea ref={inputRef} value={input} onChange={e=>setInput(e.target.value)}
+              onKeyDown={e=>{if(e.key==="Enter"&&e.shiftKey){e.preventDefault();send();}}}
+              placeholder="What did you eat? (Shift+Enter to send)"
+              rows={2}
+              style={{flex:1,background:CARD,border:`1px solid ${BORDER}`,borderRadius:18,padding:"11px 16px",fontSize:14,color:TEXT,outline:"none",resize:"none",fontFamily:BODY,lineHeight:1.5,maxHeight:120,overflowY:"auto",direction:"auto",textAlign:"start"}}/>
+            {/* [feat:photos] */}
+            <input ref={fileRef} type="file" accept="image/*" hidden onChange={onPickPhoto}/>
+            <button onClick={()=>fileRef.current&&fileRef.current.click()} disabled={loading} aria-label="Add photo" style={{width:48,height:48,borderRadius:"50%",border:`1px solid ${BORDER}`,background:"transparent",cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0}}>
+              <Icon name="camera" size={20} color={ACCENT}/>
+            </button>
+            {/* [/feat:photos] */}
+            <button onClick={send} disabled={loading} style={{width:48,height:48,borderRadius:"50%",border:"none",background:ACCENT,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0}} aria-label="Send">
+              <Icon name="send" size={18} color={ON_ACCENT}/>
+            </button>
+          </div>
+          <button onClick={newDay} style={{width:"100%",marginTop:10,padding:14,borderRadius:12,background:"transparent",border:`1px solid ${BORDER}`,color:MUTED,fontSize:13,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",gap:6}}>
+            New Day
+          </button>
+        </>}
+
+        {/* TODAY */}
+        {tab==="today"&&<>
+          <div style={{fontSize:15,lineHeight:1.5}}>
+            <span style={{color:TEXT,fontWeight:600}}>{deficit>=0?`${deficit} kcal below maintenance`:`${-deficit} kcal above maintenance`}</span>
+            <span style={{color:MUTED}}> · TDEE {cfg.tdee||"—"} · goal {cfg.calMin||"—"}–{cfg.calMax||"—"} kcal</span>
+          </div>
+          {/* [feat:nudge] */}
+          {(()=>{const nudge=proteinNudge(cfg,totalProt,new Date().getHours());return nudge?<div data-test="protein-nudge" style={{fontSize:14,lineHeight:1.5,color:MUTED,marginTop:6}}>{nudge}</div>:null;})()}
+          {/* [/feat:nudge] */}
+
+          {/* T2: carbs + fats are display-only. "—" when no meal has these fields
+              yet (legacy data). No goals, no progress bars. */}
+          <div data-test="macros-row" style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",margin:"18px 0 28px",borderTop:`1px solid ${BORDER}`,borderBottom:`1px solid ${BORDER}`}}>
+            {[
+              {key:"protein",label:"Protein",val:`${Math.round(totalProt)}g`,color:protColor,sub:`goal ${cfg.protMin||"—"}–${cfg.protMax||"—"}`},
+              {key:"carbs",label:"Carbs",val:anyMacrosKnown?`${Math.round(totalCarbs)}g`:"—",color:TEXT},
+              {key:"fats",label:"Fats",val:anyMacrosKnown?`${Math.round(totalFats)}g`:"—",color:TEXT},
+              {key:"burned",label:"Burned",val:actCal>0?`${actCal}`:"—",color:actCal>0?GREEN:TEXT,sub:"extra kcal"},
+            ].map((m,i)=>(
+              <div key={m.key} data-test={`stat-${m.key}`} style={{padding:i?"12px 0 12px 12px":"12px 0",borderLeft:i?`1px solid ${BORDER}`:"none"}}>
+                <div style={{fontSize:11,color:MUTED,letterSpacing:"0.06em",textTransform:"uppercase"}}>{m.label}</div>
+                <div style={{fontFamily:DISPLAY,fontSize:22,fontWeight:600,color:m.color,marginTop:4}}>{m.val}</div>
+                {m.sub&&<div style={{fontSize:10,color:MUTED,marginTop:2}}>{m.sub}</div>}
+              </div>
+            ))}
+          </div>
+
+          <Label>Meals</Label>
+          {cd.meals.length===0?<div style={{fontSize:14,color:MUTED,padding:"24px 0 8px",lineHeight:1.5}}>Nothing logged yet. Tell the Chat tab what you ate.</div>
+          :cd.meals.map((m,i)=>(
+            <div key={i}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"14px 0",borderBottom:editIdx===i?"none":`1px solid ${BORDER}`,opacity:m.optimistic?0.45:1,transition:"opacity .3s"}}>
+                {m.photoId&&<MealThumb photoId={m.photoId} name={m.name}/>/* [feat:photos] */}
+                <div style={{flex:1,minWidth:0,marginRight:8}}>
+                  <div style={{fontSize:15,color:m.optimistic?MUTED:TEXT,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{m.name}</div>
+                  <div style={{fontSize:12,color:MUTED,marginTop:3}}>{m.time}</div>
+                </div>
+                <div style={{display:"flex",alignItems:"center",gap:8,flexShrink:0}}>
+                  {m.optimistic
+                    ?<div style={{display:"flex",gap:3}}>{[0,1,2].map(j=><span key={j} style={{width:5,height:5,borderRadius:"50%",background:MUTED,display:"inline-block",animation:`bounce .8s ${j*0.2}s infinite`}}/>)}</div>
+                    :<>
+                      <div style={{textAlign:"right"}}>
+                        <div style={{fontSize:15,color:TEXT,fontWeight:600}}>{m.calories} kcal</div>
+                        <div style={{fontSize:12,color:MUTED,marginTop:1}}>{Math.round(m.protein)}g protein</div>
+                        {(m.carbs!=null||m.fats!=null)&&(
+                          <div style={{fontSize:11,color:MUTED,marginTop:1}}>
+                            {m.carbs!=null?`${Math.round(m.carbs)}g C`:"— C"}
+                            {" · "}
+                            {m.fats!=null?`${Math.round(m.fats)}g F`:"— F"}
+                          </div>
+                        )}
+                      </div>
+                      <button aria-label={`Edit ${m.name}`} onClick={()=>{if(editIdx===i){setEditIdx(null);setEditDraft(null);}else{setEditIdx(i);setEditDraft({name:m.name,calories:m.calories,protein:m.protein,carbs:m.carbs??"",fats:m.fats??""});}}}
+                        style={{width:44,height:44,margin:"-6px -8px -6px 0",background:"transparent",border:"none",cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center"}}>
+                        <Icon name="edit" size={18} color={editIdx===i?ACCENT:MUTED}/>
+                      </button>
+                    </>
+                  }
+                </div>
+              </div>
+              {editIdx===i&&(
+                <div style={{padding:"4px 0 18px",borderBottom:`1px solid ${BORDER}`}}>
+                  <Label style={{marginBottom:6}}>Name</Label>
+                  <input value={editDraft.name} onChange={e=>setEditDraft(d=>({...d,name:e.target.value}))}
+                    style={{...fld,width:"100%",textAlign:"start",marginBottom:14}}/>
+                  <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12,marginBottom:14}}>
+                    <div>
+                      <Label style={{marginBottom:6}}>Calories</Label>
+                      <input type="number" value={editDraft.calories} onChange={e=>setEditDraft(d=>({...d,calories:parseInt(e.target.value)||0}))} style={fld}/>
+                    </div>
+                    <div>
+                      <Label style={{marginBottom:6}}>Protein (g)</Label>
+                      <input type="number" value={editDraft.protein} onChange={e=>setEditDraft(d=>({...d,protein:parseFloat(e.target.value)||0}))} style={fld}/>
+                    </div>
+                    {/* T2: carbs and fats are optional — empty input ↔ field absent on save. */}
+                    <div>
+                      <Label style={{marginBottom:6}}>Carbs (g)</Label>
+                      <input type="number" value={editDraft.carbs??""} placeholder="—" onChange={e=>setEditDraft(d=>({...d,carbs:e.target.value===""?"":parseFloat(e.target.value)||0}))} style={fld}/>
+                    </div>
+                    <div>
+                      <Label style={{marginBottom:6}}>Fats (g)</Label>
+                      <input type="number" value={editDraft.fats??""} placeholder="—" onChange={e=>setEditDraft(d=>({...d,fats:e.target.value===""?"":parseFloat(e.target.value)||0}))} style={fld}/>
+                    </div>
+                  </div>
+                  {/* [feat:saved] */}
+                  <button onClick={addFavourite} style={{width:"100%",minHeight:44,borderRadius:12,border:`1px solid ${BORDER}`,background:"transparent",color:ACCENT,fontSize:14,cursor:"pointer",marginBottom:8}}>Add to favourites</button>
+                  {/* [/feat:saved] */}
+                  <div style={{display:"flex",gap:8}}>
+                    <button onClick={saveMealEdit} style={{flex:1,minHeight:44,borderRadius:12,border:"none",background:ACCENT,color:ON_ACCENT,fontWeight:700,fontSize:14,cursor:"pointer"}}>Save</button>
+                    <button onClick={()=>{setEditIdx(null);setEditDraft(null);}} style={{flex:1,minHeight:44,borderRadius:12,border:`1px solid ${BORDER}`,background:"transparent",color:TEXT,fontSize:14,cursor:"pointer"}}>Cancel</button>
+                    <button onClick={()=>removeMeal(i)} aria-label="Remove meal" style={{width:44,minHeight:44,borderRadius:12,border:`1px solid ${BORDER}`,background:"transparent",cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center"}}>
+                      <Icon name="trash" size={18} color={ACCENT2}/>
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+          ))}
+          {cd.meals.length>0&&(
+            <div data-test="meal-total" style={{paddingTop:16,fontWeight:600,fontSize:14}}>
+              <div style={{display:"flex",justifyContent:"space-between"}}>
+                <span>Total</span>
+                <span>{totalCal} kcal · {Math.round(totalProt)}g protein</span>
+              </div>
+              {anyMacrosKnown&&(
+                <div style={{display:"flex",justifyContent:"flex-end",fontSize:12,color:MUTED,fontWeight:400,marginTop:4}}>
+                  {Math.round(totalCarbs)}g carbs · {Math.round(totalFats)}g fats
+                </div>
+              )}
+            </div>
+          )}
+          <button onClick={resetDay} style={{width:"100%",marginTop:28,minHeight:44,borderRadius:12,background:"transparent",border:`1px solid ${BORDER}`,color:ACCENT2,fontSize:14,cursor:"pointer"}}>
+            Reset today
+          </button>
+        </>}
+
+        {/* WEIGHT */}
+        {tab==="weight"&&<>
+          <Label>Current weight</Label>
+          <div style={{display:"flex",alignItems:"baseline",gap:8,marginTop:6}}>
+            <span style={{fontFamily:DISPLAY,fontSize:64,fontWeight:500,lineHeight:1,letterSpacing:"-0.02em"}}>{latestW}</span>
+            <span style={{fontSize:16,color:MUTED}}>kg</span>
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",margin:"22px 0 28px",borderTop:`1px solid ${BORDER}`,borderBottom:`1px solid ${BORDER}`}}>
+            {[{l:"Start",v:firstW?`${firstW} kg`:"—",c:TEXT},{l:"Change",v:`-${totalLost} kg`,c:GREEN},{l:"Goal",v:cfg.goalWeight?`${cfg.goalWeight} kg`:"—",c:TEXT}].map((item,i)=>(
+              <div key={i} style={{padding:i?"12px 0 12px 12px":"12px 0",borderLeft:i?`1px solid ${BORDER}`:"none"}}>
+                <div style={{fontSize:11,color:MUTED,letterSpacing:"0.06em",textTransform:"uppercase"}}>{item.l}</div>
+                <div style={{fontFamily:DISPLAY,fontSize:20,fontWeight:600,color:item.c,marginTop:4}}>{item.v}</div>
+              </div>
+            ))}
+          </div>
+
+          <Label style={{marginBottom:10}}>Last 10 entries</Label>
+          {(()=>{
+            const pts=wl.slice(-10);
+            // [feat:trend]
+            const trendAll=movingAverage(wl.map(p=>p.weight),3);
+            const trend=trendAll.slice(-10);
+            const rate=weeklyRate(wl);
+            const rateLabel=rate===null?null:`Trend: ${(Math.round(rate*10)/10).toFixed(1)} kg/week`;
+            const lastW=pts.length?pts[pts.length-1].weight:0;
+            const towardGoal=rate!==null&&cfg.goalWeight&&((cfg.goalWeight<lastW&&rate<0)||(cfg.goalWeight>lastW&&rate>0));
+            // [/feat:trend]
+            if(pts.length<2)return<div style={{color:MUTED,fontSize:14,lineHeight:1.5}}>Add at least two weigh-ins to see a trend.</div>;
+            const minW=Math.min(...pts.map(p=>p.weight),...trend)-1;
+            const maxW=Math.max(...pts.map(p=>p.weight),...trend)+1;
+            const W=340,H=110;
+            const x=i=>20+(i/(pts.length-1))*(W-40);
+            const y=w=>H-14-((w-minW)/(maxW-minW))*(H-34);
+            const path=pts.map((p,i)=>`${i===0?"M":"L"}${x(i)},${y(p.weight)}`).join(" ");
+            const trendPath=trend.map((v,i)=>`${i===0?"M":"L"}${x(i)},${y(v)}`).join(" "); // [feat:trend]
+            return(
+              <>
+              <svg viewBox={`0 0 ${W} ${H}`} role="img" aria-label={`Weight over the last ${pts.length} entries, latest ${pts[pts.length-1].weight} kilograms${rateLabel?`, ${rateLabel.toLowerCase()}`:""}`} style={{width:"100%",overflow:"visible"}}>
+                <path d={path} fill="none" stroke={NEUTRAL} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
+                {/* [feat:trend] */}
+                <path data-test="trend-line" d={trendPath} fill="none" stroke={TEXT} strokeOpacity="0.55" strokeWidth="2" strokeDasharray="4 4" strokeLinecap="round" strokeLinejoin="round"/>
+                {/* [/feat:trend] */}
+                {pts.map((p,i)=>{
+                  const last=i===pts.length-1;
+                  return<g key={i}><circle cx={x(i)} cy={y(p.weight)} r={last?5:3} fill={last?ACCENT:NEUTRAL}/><text x={x(i)} y={y(p.weight)-11} textAnchor="middle" fontSize="11" fill={last?TEXT:MUTED}>{p.weight}</text></g>;
+                })}
+              </svg>
+              {/* [feat:trend] */}
+              <div data-test="trend-legend" style={{display:"flex",gap:16,marginTop:6,fontSize:13,color:MUTED,alignItems:"center"}}>
+                <span style={{display:"inline-flex",alignItems:"center",gap:6}}><svg width="20" height="4" aria-hidden="true"><line x1="0" y1="2" x2="20" y2="2" stroke={NEUTRAL} strokeWidth="2"/></svg>Weigh-ins</span>
+                <span style={{display:"inline-flex",alignItems:"center",gap:6}}><svg width="20" height="4" aria-hidden="true"><line x1="0" y1="2" x2="20" y2="2" stroke={TEXT} strokeOpacity="0.55" strokeWidth="2" strokeDasharray="4 4"/></svg>Trend</span>
+              </div>
+              {rateLabel&&<div data-test="trend-rate" style={{marginTop:8,fontSize:14,fontWeight:600,color:towardGoal?GREEN:TEXT}}>{rateLabel}</div>}
+              {/* [/feat:trend] */}
+              </>
+            );
+          })()}
+
+          <Label style={{margin:"30px 0 8px"}}>Log today's weight</Label>
+          <div style={{display:"flex",gap:8}}>
+            <input type="number" step="0.1" aria-label="Weight in kilograms" value={newW} onChange={e=>setNewW(e.target.value)} onKeyDown={e=>e.key==="Enter"&&addWeight()} placeholder="e.g. 87.6"
+              style={{...fld,flex:1,textAlign:"start"}}/>
+            <button onClick={addWeight} style={{padding:"0 24px",minHeight:48,borderRadius:12,border:"none",background:ACCENT,color:ON_ACCENT,fontWeight:700,fontSize:15,cursor:"pointer"}}>Save</button>
+          </div>
+          <div style={{marginTop:10}}>
+            {[...wl].reverse().slice(0,6).map((w,i,arr)=>(
+              <div key={i} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"12px 0",borderBottom:i<arr.length-1?`1px solid ${BORDER}`:"none"}}>
+                <span style={{fontSize:13,color:MUTED}}>{w.date}</span>
+                <span style={{fontSize:15,fontWeight:600}}>{w.weight} kg</span>
+              </div>
+            ))}
+          </div>
+        </>}
+
+        {/* INSIGHTS */}
+        {tab==="insights"&&<>
+          <Label style={{marginBottom:2}}>Last 7 days</Label>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",borderTop:`1px solid ${BORDER}`,borderBottom:`1px solid ${BORDER}`,marginTop:8}}>
+            {[
+              {label:"Avg calories",val:avgCal??"—",color:avgCal&&cfg.calMax&&avgCal<=cfg.calMax?GREEN:TEXT},
+              {label:"Avg protein",val:avgProt?`${avgProt}g`:"—",color:avgProt&&cfg.protMin&&avgProt>=cfg.protMin?GREEN:TEXT},
+              {label:"Weekly deficit",val:weekDef>0?weekDef.toLocaleString():"—",color:TEXT},
+              {label:"Fat loss est.",val:weekDef>0?`${(weekDef/7700).toFixed(2)} kg`:"—",color:TEXT},
+            ].map((m,i)=>(
+              <div key={i} style={{padding:"14px 0 14px "+(i%2?14:0)+"px",borderLeft:i%2?`1px solid ${BORDER}`:"none",borderTop:i>1?`1px solid ${BORDER}`:"none"}}>
+                <div style={{fontSize:11,color:MUTED,letterSpacing:"0.06em",textTransform:"uppercase"}}>{m.label}</div>
+                <div style={{fontFamily:DISPLAY,fontSize:28,fontWeight:600,color:m.color,marginTop:4,lineHeight:1.1}}>{m.val}</div>
+              </div>
+            ))}
+          </div>
+
+          {/* [feat:recap] */}
+          <Label style={{margin:"30px 0 4px"}}>Weekly recap</Label>
+          <WeeklyRecap data={data}/>
+          {/* [/feat:recap] */}
+
+          <Label style={{margin:"30px 0 4px"}}>Today's read</Label>
+          {[
+            {icon:totalProt>=(cfg.protMin||0)?"check":"alert",color:totalProt>=(cfg.protMin||0)?GREEN:AMBER,text:totalProt>=(cfg.protMin||0)?"Great protein today!":"Low protein — add chicken, tuna or eggs"},
+            {icon:netCal<1400||netCal>(cfg.calMax||9999)?"alert":"check",color:netCal<1400||netCal>(cfg.calMax||9999)?AMBER:GREEN,text:netCal<1400?"Too low — aggressive deficit risks muscle loss":netCal>(cfg.calMax||9999)?"Over daily goal":"Calorie range is on point!"},
+            {icon:"tip",color:MUTED,text:"Winning pattern: breakfast+lunch ~800 kcal, dinner ~700 kcal"},
+          ].map((t,i)=>(
+            <div key={i} style={{display:"flex",gap:12,alignItems:"flex-start",padding:"13px 0",borderBottom:`1px solid ${BORDER}`}}>
+              <Icon name={t.icon} size={18} color={t.color} style={{marginTop:1}}/>
+              <span style={{fontSize:14,color:TEXT,lineHeight:1.5}}>{t.text}</span>
+            </div>
+          ))}
+
+          <Label style={{margin:"30px 0 4px"}}>History</Label>
+          {data.days.length===0?<div style={{fontSize:14,color:MUTED,padding:"14px 0",lineHeight:1.5}}>Press "New Day" at the end of each day to save it here.</div>
+          :[...data.days].reverse().slice(0,7).map((d,i,arr)=>(
+            <div key={i} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"13px 0",borderBottom:i<arr.length-1?`1px solid ${BORDER}`:"none"}}>
+              <span style={{fontSize:13,color:MUTED}}>{d.date}</span>
+              <div style={{display:"flex",gap:14,fontSize:14,alignItems:"baseline"}}>
+                <span>{d.netCal} kcal</span>
+                <span style={{color:MUTED}}>{Math.round(d.totalProt??d.totalProtein??0)}g</span>
+                <span style={{color:(cfg.tdee||0)-d.netCal>0?GREEN:ACCENT2,fontSize:12,minWidth:38,textAlign:"right"}}>{(cfg.tdee||0)-d.netCal>0?"+":""}{(cfg.tdee||0)-d.netCal}</span>
+              </div>
+            </div>
+          ))}
+        </>}
+
+        {/* SETTINGS */}
+        {tab==="settings"&&draft&&<>
+          {needsSetup&&(
+            <div style={{background:CARD2,border:`1px solid ${BORDER}`,borderRadius:12,padding:"14px 16px",marginBottom:22,fontSize:14,color:TEXT,lineHeight:1.5}}>
+              Welcome! Fill in your details below to start tracking.
+            </div>
+          )}
+          <div style={{marginBottom:28}}>
+            <Label style={{marginBottom:2}}>Profile</Label>
+            <SettingRow label="Name" desc="Your display name">
+              <input value={draft.name||""} onChange={e=>setDraft(d=>({...d,name:e.target.value}))} placeholder="Optional"
+                style={{...fld,width:140,textAlign:"start"}}/>
+            </SettingRow>
+            <SettingRow label="Start Weight" desc="Used for total loss calculation">
+              <div style={{display:"flex",alignItems:"center",gap:6}}>
+                <input type="number" step="0.1" value={draft.startWeight||""} onChange={e=>setDraft(d=>({...d,startWeight:parseFloat(e.target.value)||null}))} placeholder="e.g. 90"
+                  style={{...fld,width:88,textAlign:"center"}}/>
+                <span style={{fontSize:12,color:MUTED}}>kg</span>
+              </div>
+            </SettingRow>
+            <SettingRow label="Goal Weight" desc="Target body weight">
+              <div style={{display:"flex",alignItems:"center",gap:6}}>
+                <input type="number" step="0.1" value={draft.goalWeight||""} onChange={e=>setDraft(d=>({...d,goalWeight:parseFloat(e.target.value)||null}))} placeholder="e.g. 75"
+                  style={{...fld,width:88,textAlign:"center"}}/>
+                <span style={{fontSize:12,color:MUTED}}>kg</span>
+              </div>
+            </SettingRow>
+          </div>
+          <div style={{marginBottom:28}}>
+            <Label style={{marginBottom:2}}>Calorie Targets</Label>
+            <SettingRow label="TDEE" desc="Total daily energy expenditure">
+              <div style={{display:"flex",alignItems:"center",gap:6}}>
+                <input type="number" step="10" value={draft.tdee||""} onChange={e=>setDraft(d=>({...d,tdee:parseInt(e.target.value)||null}))} placeholder="e.g. 2500"
+                  style={{...fld,width:88,textAlign:"center"}}/>
+                <span style={{fontSize:12,color:MUTED}}>kcal</span>
+              </div>
+            </SettingRow>
+            <SettingRow label="Daily Min" desc="Lower calorie bound">
+              <div style={{display:"flex",alignItems:"center",gap:6}}>
+                <input type="number" step="50" value={draft.calMin||""} onChange={e=>setDraft(d=>({...d,calMin:parseInt(e.target.value)||null}))} placeholder="e.g. 1600"
+                  style={{...fld,width:88,textAlign:"center"}}/>
+                <span style={{fontSize:12,color:MUTED}}>kcal</span>
+              </div>
+            </SettingRow>
+            <SettingRow label="Daily Max" desc="Upper calorie bound">
+              <div style={{display:"flex",alignItems:"center",gap:6}}>
+                <input type="number" step="50" value={draft.calMax||""} onChange={e=>setDraft(d=>({...d,calMax:parseInt(e.target.value)||null}))} placeholder="e.g. 1900"
+                  style={{...fld,width:88,textAlign:"center"}}/>
+                <span style={{fontSize:12,color:MUTED}}>kcal</span>
+              </div>
+            </SettingRow>
+          </div>
+          <div style={{marginBottom:28}}>
+            <Label style={{marginBottom:2}}>Protein Targets</Label>
+            <SettingRow label="Protein Min" desc="Minimum daily protein">
+              <div style={{display:"flex",alignItems:"center",gap:6}}>
+                <input type="number" step="5" value={draft.protMin||""} onChange={e=>setDraft(d=>({...d,protMin:parseInt(e.target.value)||null}))} placeholder="e.g. 100"
+                  style={{...fld,width:88,textAlign:"center"}}/>
+                <span style={{fontSize:12,color:MUTED}}>g</span>
+              </div>
+            </SettingRow>
+            <SettingRow label="Protein Max" desc="Target protein ceiling">
+              <div style={{display:"flex",alignItems:"center",gap:6}}>
+                <input type="number" step="5" value={draft.protMax||""} onChange={e=>setDraft(d=>({...d,protMax:parseInt(e.target.value)||null}))} placeholder="e.g. 130"
+                  style={{...fld,width:88,textAlign:"center"}}/>
+                <span style={{fontSize:12,color:MUTED}}>g</span>
+              </div>
+            </SettingRow>
+          </div>
+          <button onClick={saveSettings} style={{width:"100%",padding:"13px",borderRadius:14,border:"none",background:ACCENT,color:ON_ACCENT,fontWeight:700,fontSize:15,cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center",gap:8}}>
+            Save Settings
+          </button>
+          {/* [feat:export] */}
+          <div style={{borderTop:`1px solid ${BORDER}`,marginTop:28,paddingTop:22}}>
+            <Label style={{marginBottom:10}}>Your data</Label>
+            <div style={{display:"flex",flexDirection:"column",gap:10}}>
+              <button onClick={()=>runExport("json",data,showToast)} style={{width:"100%",minHeight:48,padding:"12px",borderRadius:14,border:`1px solid ${ACCENT}`,background:"transparent",color:ACCENT,fontWeight:600,fontSize:15,cursor:"pointer"}}>Export everything (JSON)</button>
+              <button onClick={()=>runExport("csv",data,showToast)} style={{width:"100%",minHeight:48,padding:"12px",borderRadius:14,border:`1px solid ${ACCENT}`,background:"transparent",color:ACCENT,fontWeight:600,fontSize:15,cursor:"pointer"}}>Export daily log (CSV)</button>
+            </div>
+            <div data-test="export-summary" style={{fontSize:12,color:MUTED,marginTop:10}}>{(c=>`${c.days} days · ${c.meals} meals · ${c.weighIns} weigh-ins`)(exportCounts(data))}</div>
+          </div>
+          {/* [/feat:export] */}
+        </>}
+
+      </div>
+      <nav aria-label="Main" style={{position:"fixed",bottom:0,left:"50%",transform:"translateX(-50%)",width:"100%",maxWidth:430,background:BG,borderTop:`1px solid ${BORDER}`,display:"flex",padding:"6px 8px calc(6px + env(safe-area-inset-bottom))",zIndex:50}}>
+        {tabs.map(t=>{
+          const on=tab===t.id;
+          return(
+            <button key={t.id} onClick={()=>setTab(t.id)} aria-current={on?"page":undefined} style={{flex:1,minHeight:52,background:"transparent",border:"none",cursor:"pointer",color:on?ACCENT:MUTED,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:4,transition:"color .15s"}}>
+              <Icon name={t.icon} size={24} color={on?ACCENT:MUTED} active={on}/>
+              <span style={{fontSize:11,fontWeight:on?700:500}}>{t.label}</span>
+            </button>
+          );
+        })}
+      </nav>
+      <style>{`
+        @keyframes bounce{0%,80%,100%{transform:scale(0.5)}40%{transform:scale(1)}}
+        @keyframes fadeIn{from{opacity:0;transform:translateX(-50%) translateY(-8px)}to{opacity:1;transform:translateX(-50%) translateY(0)}}
+        @keyframes spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}
+        input::placeholder,textarea::placeholder{color:#8C7F70}
+        button:active{opacity:.7}
+        ::-webkit-scrollbar{width:0}
+      `}</style>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+</script>
+</body>
+</html>
